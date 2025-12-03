@@ -6,14 +6,19 @@ const express = require('express');
 const multer = require('multer');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+require('dotenv').config();
 
 program
-  .requiredOption('-h, --host <address>', 'Адреса сервера')
-  .requiredOption('-p, --port <number>', 'Порт сервера')
-  .requiredOption('-c, --cache <path>', 'Шлях до директорії кешу');
+  .option('-h, --host <address>', 'Адреса сервера')
+  .option('-p, --port <number>', 'Порт сервера')
+  .option('-c, --cache <path>', 'Шлях до директорії кешу');
 
 program.parse(process.argv);
-const { host, port, cache } = program.opts();
+const opts = program.opts();
+
+const host = opts.host || process.env.HOST || '0.0.0.0';
+const port = opts.port || process.env.PORT || 3000;
+const cache = opts.cache || process.env.CACHE_DIR || './cache';
 
 const cachePath = path.resolve(cache);
 
@@ -22,7 +27,7 @@ try {
     fs.mkdirSync(cachePath, { recursive: true });
   }
 } catch (err) {
-  console.error(`Не вдалося створити директорію кешу: ${err.message}`);
+  console.error(`Не вдалося створити   директорію кешу: ${err.message}`);
   process.exit(1);
 }
 
@@ -373,6 +378,6 @@ app.use((req, res) => res.status(404).send('Not Found'));
 const server = http.createServer(app);
 
 server.listen(port, host, () => {
-  console.log(`Server is running at http://${host}:${port}`);
+  console.log(`Server is     running at http://${host}:${port}`);
   console.log(`Swagger Docs available at http://${host}:${port}/docs`);
 });
