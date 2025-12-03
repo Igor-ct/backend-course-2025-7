@@ -48,7 +48,7 @@ const swaggerOptions = {
       version: '1.0.0',
       description: 'API Documentation',
     },
-    servers: [{ url: `http://${host}:${port}` }],
+    servers: [{ url: `http://localhost:${port}` }],
   },
   apis: [__filename],
 };
