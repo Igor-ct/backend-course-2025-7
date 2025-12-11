@@ -6,7 +6,9 @@ const express = require('express');
 const multer = require('multer');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+const mysql = require('mysql2/promise'); 
 require('dotenv').config();
+
 
 program
   .option('-h, --host <address>', 'Адреса сервера')
@@ -22,14 +24,35 @@ const cache = opts.cache || process.env.CACHE_DIR || './cache';
 
 const cachePath = path.resolve(cache);
 
-try {
-  if (!fs.existsSync(cachePath)) {
-    fs.mkdirSync(cachePath, { recursive: true });
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,       
+  user: process.env.DB_USER,       
+  password: process.env.DB_PASSWORD, 
+  database: process.env.DB_NAME,   
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+async function waitForDB() {
+  let retries = 10; 
+  while (retries > 0) {
+    try {
+      const conn = await pool.getConnection();
+      console.log("✅ Успішне з'єднання з Базою Даних!");
+      conn.release();
+      return; 
+    } catch (err) {
+      console.log(`⏳ База ще завантажується... Чекаємо 5 секунд. (Залишилось спроб: ${retries})`);
+      retries -= 1;
+      await new Promise(res => setTimeout(res, 5000)); 
+    }
   }
-} catch (err) {
-  console.error(`Не вдалося створити   директорію кешу: ${err.message}`);
+  console.error("❌ Не вдалося підключитися до БД. Вимикаємо сервер.");
   process.exit(1);
 }
+
+waitForDB();
 
 const app = express();
 
@@ -39,11 +62,11 @@ app.use(express.urlencoded({ extended: true }));
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, cachePath),
   filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  },
+  }
 });
-const upload = multer({ storage });
+const upload = multer({ storage: storage });
 
 const swaggerOptions = {
   definition: {
@@ -61,8 +84,7 @@ const swaggerOptions = {
 const swaggerDocs = swaggerJsdoc(swaggerOptions);
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 
-let inventory = [];
-let idCounter = 1;
+
 
 app.route('/RegisterForm.html')
   .get((req, res) => res.sendFile(path.join(__dirname, 'RegisterForm.html')))
@@ -116,7 +138,7 @@ app.route('/SearchForm.html')
  *       400:
  *         description: Bad Request
  */
-app.post('/register', upload.single('photo'), (req, res) => {
+app.post('/register', upload.single('photo'), async (req, res) => {
   const { inventory_name, description } = req.body;
 
   if (!inventory_name) {
@@ -124,16 +146,27 @@ app.post('/register', upload.single('photo'), (req, res) => {
     return res.status(400).send('inventory_name is required');
   }
 
-  const newItem = {
-    id: idCounter++,
-    inventory_name,
-    description: description || '',
-    photo: req.file ? req.file.filename : null,
-  };
+  try {
+    const [result] = await pool.execute(
+      "INSERT INTO inventory (inventory_name, description, photo) VALUES (?, ?, ?)",
+      [inventory_name, description || '', req.file ? req.file.filename : null]
+    );
 
-  inventory.push(newItem);
-  res.status(201).json(newItem);
+    const newItem = {
+      id: result.insertId,
+      inventory_name,
+      description: description || '',
+      photo: req.file ? req.file.filename : null,
+    };
+
+    res.status(201).json(newItem);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Database error');
+  }
 });
+
 
 /**
  * @swagger
@@ -150,13 +183,22 @@ app.post('/register', upload.single('photo'), (req, res) => {
  *               items:
  *                 $ref: '#/components/schemas/Item'
  */
-app.get('/inventory', (req, res) => {
-  const result = inventory.map(item => ({
-    ...item,
-    photoUrl: item.photo ? `/inventory/${item.id}/photo` : null,
-  }));
-  res.status(200).json(result);
+app.get('/inventory', async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT * FROM inventory");
+
+    const result = rows.map(item => ({
+      ...item,
+      photoUrl: item.photo ? `/inventory/${item.id}/photo` : null
+    }));
+
+    res.json(result);
+
+  } catch (err) {
+    res.status(500).send('Database error');
+  }
 });
+
 
 /**
  * @swagger
@@ -213,40 +255,66 @@ app.get('/inventory', (req, res) => {
  *       404:
  *         description: Not found
  */
-app.route('/inventory/:id')
-  .get((req, res) => {
-    const item = inventory.find(i => i.id === parseInt(req.params.id));
-    if (!item) return res.status(404).send('Not found');
+app.get('/inventory/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT * FROM inventory WHERE id = ?", [req.params.id]);
 
-    res.status(200).json({
+    if (rows.length === 0) return res.status(404).send('Not found');
+
+    const item = rows[0];
+
+    res.json({
       ...item,
-      photoUrl: item.photo ? `/inventory/${item.id}/photo` : null,
+      photoUrl: item.photo ? `/inventory/${item.id}/photo` : null
     });
-  })
 
-  .put((req, res) => {
-    const item = inventory.find(i => i.id === parseInt(req.params.id));
-    if (!item) return res.status(404).send('Not found');
+  } catch (err) {
+    res.status(500).send('Database error');
+  }
+});
 
-    if (req.body.inventory_name) item.inventory_name = req.body.inventory_name;
-    if (req.body.description) item.description = req.body.description;
 
-    res.status(200).json(item);
-  })
+app.put('/inventory/:id', async (req, res) => {
+  const { inventory_name, description } = req.body;
 
-  .delete((req, res) => {
-    const idx = inventory.findIndex(i => i.id === parseInt(req.params.id));
-    if (idx === -1) return res.status(404).send('Not found');
+  try {
+    const [result] = await pool.execute(
+      "UPDATE inventory SET inventory_name=?, description=? WHERE id=?",
+      [inventory_name, description, req.params.id]
+    );
 
-    const item = inventory[idx];
-    if (item.photo) {
-      const p = path.join(cachePath, item.photo);
+    if (result.affectedRows === 0) return res.status(404).send('Not found');
+
+    res.json({ id: req.params.id, inventory_name, description });
+
+  } catch (err) {
+    console.error(err); 
+    res.status(500).send('Database error');
+  }
+});
+
+
+app.delete('/inventory/:id', async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT photo FROM inventory WHERE id=?", [req.params.id]);
+
+    if (rows.length === 0) return res.status(404).send('Not found');
+
+    const photo = rows[0].photo;
+
+    if (photo) {
+      const p = path.join(cachePath, photo);
       if (fs.existsSync(p)) fs.unlinkSync(p);
     }
 
-    inventory.splice(idx, 1);
-    res.status(200).send('Deleted');
-  });
+    await pool.execute("DELETE FROM inventory WHERE id=?", [req.params.id]);
+
+    res.send('Deleted');
+
+  } catch (err) {
+    res.status(500).send('Database error');
+  }
+});
 
 /**
  * @swagger
@@ -289,34 +357,51 @@ app.route('/inventory/:id')
  *       404:
  *         description: Not found
  */
-app.route('/inventory/:id/photo')
-  .get((req, res) => {
-    const item = inventory.find(i => i.id === parseInt(req.params.id));
-    if (!item || !item.photo) return res.status(404).send('Photo not found');
+app.get('/inventory/:id/photo', async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT photo FROM inventory WHERE id=?", [req.params.id]);
 
-    const p = path.join(cachePath, item.photo);
-    if (fs.existsSync(p)) return res.sendFile(p);
+    if (!rows.length || !rows[0].photo) return res.status(404).send('Photo not found');
 
-    res.status(404).send('File missing');
-  })
+    const filepath = path.join(cachePath, rows[0].photo);
+    if (!fs.existsSync(filepath)) return res.status(404).send('File missing');
 
-  .put(upload.single('photo'), (req, res) => {
-    const item = inventory.find(i => i.id === parseInt(req.params.id));
-    if (!item) {
+    res.sendFile(filepath);
+
+  } catch (err) {
+    res.status(500).send('Database error');
+  }
+});
+
+
+app.put('/inventory/:id/photo', upload.single('photo'), async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT photo FROM inventory WHERE id=?", [req.params.id]);
+    if (!rows.length) {
       if (req.file) fs.unlinkSync(req.file.path);
       return res.status(404).send('Item not found');
     }
 
     if (!req.file) return res.status(400).send('No file uploaded');
 
-    if (item.photo) {
-      const oldP = path.join(cachePath, item.photo);
-      if (fs.existsSync(oldP)) fs.unlinkSync(oldP);
+    const oldPhoto = rows[0].photo;
+    if (oldPhoto) {
+      const oldPath = path.join(cachePath, oldPhoto);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
     }
 
-    item.photo = req.file.filename;
-    res.status(200).send('Photo updated');
-  });
+    await pool.execute(
+      "UPDATE inventory SET photo=? WHERE id=?",
+      [req.file.filename, req.params.id]
+    );
+
+    res.send('Photo updated');
+
+  } catch (err) {
+    res.status(500).send('Database error');
+  }
+});
+
 
 /**
  * @swagger
@@ -353,25 +438,32 @@ app.route('/search')
   })
   .all((req, res) => res.sendStatus(405));
 
-function performSearch(res, id, hasPhoto) {
+async function performSearch(res, id, hasPhoto) {
   if (!id) return res.status(400).send('ID is required');
 
-  const item = inventory.find(i => i.id === id);
+  try {
+    const [rows] = await pool.execute("SELECT * FROM inventory WHERE id=?", [id]);
 
-  if (!item) return res.status(404).send('Not Found');
+    if (!rows.length) return res.status(404).send('Not Found');
 
-  const responseData = {
-    id: item.id,
-    inventory_name: item.inventory_name,
-    description: item.description
-  };
+    const item = rows[0];
 
-  if (hasPhoto && item.photo) {
-    responseData.photoUrl = `/inventory/${item.id}/photo`;
+    const result = {
+      id: item.id,
+      inventory_name: item.inventory_name,
+      description: item.description,
+    };
+
+    if (hasPhoto && item.photo)
+      result.photoUrl = `/inventory/${item.id}/photo`;
+
+    res.json(result);
+
+  } catch (err) {
+    res.status(500).send('Database error');
   }
-
-  res.status(200).json(responseData);
 }
+
 
 app.use((req, res) => res.status(404).send('Not Found'));
 
